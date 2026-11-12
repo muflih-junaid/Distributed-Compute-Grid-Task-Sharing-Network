@@ -67,6 +67,13 @@ public class Message {
     public static Message taskRequest(String workerId) {
         return new Message(TASK_REQUEST, workerId, new JsonObject());
     }
+    public static Message registerWorker(String workerId) {
+
+        JsonObject payload = new JsonObject();
+        payload.addProperty("role", "WORKER");
+
+        return new Message(REGISTER, workerId, payload);
+    }
 
     // Add more builders here as you implement each message type —
     // e.g. taskAssign(...), taskResult(...), jobSubmit(...), jobResult(...).
