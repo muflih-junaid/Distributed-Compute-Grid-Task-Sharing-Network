@@ -36,6 +36,17 @@ public class WorkerRegistry {
         }
     }
 
+    public static synchronized boolean removeAndCheck(String workerId, Socket socket) {
+        if (!workers.remove(workerId, socket)) {
+            return false;
+        }
+
+        handlers.remove(workerId);
+        workerCapacities.remove(workerId);
+
+        return true;
+    }
+
     public static Socket getWorker(String workerId) {
         return workers.get(workerId);
     }

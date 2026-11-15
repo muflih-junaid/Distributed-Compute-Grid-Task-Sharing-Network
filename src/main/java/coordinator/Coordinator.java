@@ -11,6 +11,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import java.io.PrintWriter;
+
 import protocol.Message;
 import protocol.Message.JsonObject;
 
@@ -22,6 +28,7 @@ public class Coordinator implements Runnable {
     private final Map<String, Set<String>> workerAssignments = new ConcurrentHashMap<>();
     private final Map<String, List<TaskQueue.TaskAssignment>> jobTaskAssignments = new ConcurrentHashMap<>();
     private final Map<String, Map<String, List<List<?>>>> jobResults = new ConcurrentHashMap<>();
+    private final Set<String> completedJobs = ConcurrentHashMap.newKeySet();
 
     public Coordinator(int port) {
         this.port = port;
@@ -29,6 +36,7 @@ public class Coordinator implements Runnable {
 
     @Override
     public void run() {
+        startHeartbeatMonitor();
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Coordinator listening on " + port);
 
@@ -82,16 +90,24 @@ public class Coordinator implements Runnable {
         dispatchNextTaskTo(workerId, true);
     }
 
-    private boolean dispatchNextTaskTo(String workerId, boolean notifyWhenUnavailable) {
+    private boolean dispatchNextTaskTo(
+            String workerId,
+            boolean notifyWhenUnavailable) {
+
         WorkerHandler workerHandler = WorkerRegistry.getHandler(workerId);
+
         if (workerHandler == null) {
             return false;
         }
 
-        Set<String> assignedTasks = workerAssignments.computeIfAbsent(workerId,
+        Set<String> assignedTasks = workerAssignments.computeIfAbsent(
+                workerId,
                 ignored -> ConcurrentHashMap.newKeySet());
+
         synchronized (assignedTasks) {
+
             int capacity = WorkerRegistry.getMaxConcurrentChunks(workerId);
+
             if (assignedTasks.size() >= capacity) {
                 if (notifyWhenUnavailable) {
                     workerHandler.sendMessage(Message.noTaskAvailable(workerId));
@@ -100,6 +116,7 @@ public class Coordinator implements Runnable {
             }
 
             TaskQueue.TaskAssignment task = taskQueue.pollNextTask();
+
             if (task == null) {
                 if (notifyWhenUnavailable) {
                     workerHandler.sendMessage(Message.noTaskAvailable(workerId));
@@ -107,10 +124,34 @@ public class Coordinator implements Runnable {
                 return false;
             }
 
+            // Try sending the task before recording it as in-flight.
+            boolean sent = workerHandler.sendMessage(
+                    task.toTaskAssignMessage(workerId));
+
+            if (!sent) {
+                System.err.println(
+                        "Failed to send task " + task.getTaskId()
+                                + " to Worker " + workerId);
+
+                // Close the failed Worker connection.
+                workerHandler.disconnect();
+
+                // Requeue the original task.
+                retryAndRequeueTask(
+                        task,
+                        "Task transmission failed");
+
+                return false;
+            }
+
+            // Record the assignment only after successful transmission.
             assignedTasks.add(task.getTaskId());
             inFlightAssignments.put(task.getTaskId(), task);
-            workerHandler.sendMessage(task.toTaskAssignMessage(workerId));
-            System.out.println("Assigned " + task.getTaskId() + " to worker " + workerId);
+
+            System.out.println(
+                    "Assigned " + task.getTaskId()
+                            + " to worker " + workerId);
+
             return true;
         }
     }
@@ -160,28 +201,97 @@ public class Coordinator implements Runnable {
 
         Object successValue = payload.get("success");
         if (!Boolean.TRUE.equals(successValue)) {
-            System.err.println("Task " + taskId + " failed on worker " + workerId + ": " + payload.get("errorMessage"));
-            taskQueue.enqueueTask(task);
-            dispatchAvailableTasks();
+
+            String errorMessage = String.valueOf(
+                    payload.get("errorMessage"));
+
+            System.err.println(
+                    "Task " + taskId + " failed on worker "
+                            + workerId + ": " + errorMessage);
+
+            retryAndRequeueTask(task, errorMessage);
+
             return;
         }
 
         Object resultValue = payload.get("result");
+
         if (!(resultValue instanceof List<?>)) {
-            System.err.println("Task " + taskId + " completed without result rows");
+
+            System.err.println(
+                    "Task " + taskId
+                            + " completed without valid result rows.");
+
+            retryAndRequeueTask(
+                    task,
+                    "Worker returned an invalid result");
+
             return;
         }
 
         String jobId = task.getJobId();
-        Map<String, List<List<?>>> partialResults = jobResults.computeIfAbsent(jobId, ignored -> new ConcurrentHashMap<>());
+        Map<String, List<List<?>>> partialResults = jobResults.computeIfAbsent(jobId,
+                ignored -> new ConcurrentHashMap<>());
         partialResults.put(taskId, asMatrixRows((List<?>) resultValue));
+        taskQueue.markTaskCompleted(taskId);
 
         List<TaskQueue.TaskAssignment> tasksForJob = jobTaskAssignments.get(jobId);
-        if (tasksForJob != null && partialResults.size() == tasksForJob.size()) {
+
+        if (tasksForJob != null &&
+                partialResults.size() == tasksForJob.size() &&
+                completedJobs.add(jobId)) {
+
+            // Assemble all Worker results into the final matrix
             List<List<?>> finalMatrix = assembleJobResult(tasksForJob, partialResults);
+
             System.out.println("Job " + jobId + " complete: " + finalMatrix);
+
+            // Calculate total elapsed time
+            long startTime = jobStartTimes.getOrDefault(
+                    jobId, System.currentTimeMillis());
+
+            long elapsedMs = System.currentTimeMillis() - startTime;
+
+            // Prepare JOB_RESULT payload
+            JsonObject resultPayload = new JsonObject();
+
+            resultPayload.addProperty("jobId", jobId);
+            resultPayload.add("result", finalMatrix);
+            resultPayload.addProperty("elapsedMs", elapsedMs);
+
+            // Create JOB_RESULT message
+            Message resultMessage = new Message(
+                    Message.JOB_RESULT,
+                    "coordinator",
+                    resultPayload);
+
+            // Send result to the original Client
+            ClientConnection clientConnection = clientConnections.remove(jobId);
+
+            if (clientConnection != null) {
+
+                boolean sent = clientConnection.send(resultMessage);
+
+                if (sent) {
+                    System.out.println(
+                            "Final result sent to Client for job " + jobId);
+                } else {
+                    System.err.println(
+                            "Failed to send result to Client for job " + jobId);
+                }
+
+                clientConnection.close();
+
+            } else {
+                System.err.println(
+                        "No Client connection found for job " + jobId);
+            }
+
+            // Clean up completed job information
+            jobStartTimes.remove(jobId);
             jobResults.remove(jobId);
             jobTaskAssignments.remove(jobId);
+            completedJobs.remove(jobId);
         }
 
         dispatchAvailableTasks();
@@ -210,16 +320,182 @@ public class Coordinator implements Runnable {
             }
             return;
         }
+        List<?> rowsA = (List<?>) matrixA;
+        List<?> rowsB = (List<?>) matrixB;
+
+        int columnsA;
+
+        try {
+            columnsA = validateMatrix(rowsA, "Matrix A");
+            validateMatrix(rowsB, "Matrix B");
+
+        } catch (IllegalArgumentException e) {
+
+            System.err.println("Invalid job: " + e.getMessage());
+
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Ignore closure failures while rejecting the job.
+            }
+
+            return;
+        }
+
+        // Check matrix multiplication compatibility
+        if (columnsA != rowsB.size()) {
+
+            System.err.println("Invalid matrix dimensions!");
+            System.err.println("Matrix A columns: " + columnsA);
+            System.err.println("Matrix B rows: " + rowsB.size());
+            System.err.println("Matrix A columns must equal Matrix B rows.");
+
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Ignore closure failures while rejecting the job.
+            }
+
+            return;
+        }
+
+        System.out.println("Matrix dimensions validated successfully.");
+        System.out.println("Matrix A: " + rowsA.size() + " x " + columnsA);
+        System.out.println("Matrix B: " + rowsB.size() + " x " + ((List<?>) rowsB.get(0)).size());
 
         String jobId = "job-" + System.nanoTime();
         int totalWorkerCapacity = WorkerRegistry.getWorkerIds().stream()
                 .mapToInt(WorkerRegistry::getMaxConcurrentChunks)
                 .sum();
-        int chunkCount = Math.max(1, totalWorkerCapacity);
-        List<TaskQueue.TaskAssignment> tasks = taskQueue.submitTasks(jobId, (List<?>) matrixA, (List<?>) matrixB, chunkCount);
+        int chunkCount = WorkerRegistry.getWorkerCount();
+
+        if (chunkCount == 0) {
+            chunkCount = 1;
+        }
+        // Create and save the Client connection for this job
+        ClientConnection clientConnection;
+
+        try {
+            clientConnection = new ClientConnection(socket);
+        } catch (IOException e) {
+            System.err.println("Could not save Client connection: " + e.getMessage());
+
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Ignore closure failures.
+            }
+
+            return;
+        }
+
+        // Save the connection and job start time BEFORE dispatching tasks
+        clientConnections.put(jobId, clientConnection);
+        jobStartTimes.put(jobId, System.currentTimeMillis());
+
+        // Create and store task chunks
+        List<TaskQueue.TaskAssignment> tasks = taskQueue.submitTasks(jobId, rowsA, rowsB, chunkCount);
+
         jobTaskAssignments.put(jobId, tasks);
-        System.out.println("Queued job " + jobId + " with " + tasks.size() + " task chunks");
+
+        System.out.println("Queued job " + jobId
+                + " with " + tasks.size() + " task chunks");
+
+        // Dispatch tasks to available Workers
         dispatchAvailableTasks();
+    }
+
+    private void retryAndRequeueTask(
+            TaskQueue.TaskAssignment task,
+            String reason) {
+
+        if (task == null) {
+            return;
+        }
+
+        // Increase the retry counter.
+        // TaskQueue now allows unlimited retries.
+        boolean retryAllowed = taskQueue.retryTask(task.getTaskId());
+
+        if (retryAllowed) {
+
+            int retryCount = taskQueue.getRetryCounts()
+                    .getOrDefault(task.getTaskId(), 0);
+
+            System.err.println(
+                    "Requeuing task " + task.getTaskId()
+                            + " | Attempt: " + retryCount
+                            + " | Reason: " + reason);
+
+            // Put the same task back into the pending queue.
+            // Its taskId and row range remain unchanged.
+            taskQueue.enqueueTask(task);
+
+            // Try to assign it to an available Worker.
+            dispatchAvailableTasks();
+
+        } else {
+            System.err.println(
+                    "Task could not be requeued: " + task.getTaskId());
+        }
+    }
+
+    private int validateMatrix(List<?> matrix, String matrixName) {
+
+        if (matrix.isEmpty()) {
+            throw new IllegalArgumentException(
+                    matrixName + " must contain at least one row");
+        }
+
+        int columnCount = -1;
+
+        for (int i = 0; i < matrix.size(); i++) {
+
+            Object rowValue = matrix.get(i);
+
+            if (!(rowValue instanceof List<?>)) {
+                throw new IllegalArgumentException(
+                        matrixName + " must contain only array rows");
+            }
+
+            List<?> row = (List<?>) rowValue;
+
+            if (row.isEmpty()) {
+                throw new IllegalArgumentException(
+                        matrixName + " cannot contain empty rows");
+            }
+
+            if (columnCount == -1) {
+                columnCount = row.size();
+            } else if (row.size() != columnCount) {
+                throw new IllegalArgumentException(
+                        matrixName + " must be rectangular");
+            }
+
+            // Check that all values are integers
+            for (Object value : row) {
+
+                if (!(value instanceof Number)) {
+                    throw new IllegalArgumentException(
+                            matrixName + " must contain numeric values");
+                }
+
+                try {
+                    java.math.BigDecimal number = new java.math.BigDecimal(value.toString());
+
+                    if (number.stripTrailingZeros().scale() > 0) {
+                        throw new IllegalArgumentException(
+                                matrixName + " must contain integer values");
+                    }
+
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException(
+                            matrixName + " contains an invalid number");
+                }
+            }
+        }
+
+        return columnCount;
     }
 
     private List<List<?>> asMatrixRows(List<?> resultRows) {
@@ -260,11 +536,123 @@ public class Coordinator implements Runnable {
         }
 
         List<List<?>> compact = new ArrayList<>();
-        for (List<?> row : assembled) {
-            if (row != null) {
-                compact.add((List<?>) row);
+        for (int i = 0; i < assembled.size(); i++) {
+            if (assembled.get(i) == null) {
+                throw new IllegalStateException(
+                        "Missing result for matrix row " + i);
             }
         }
-        return compact;
+
+        return assembled;
+
     }
+
+    public void handleWorkerDisconnect(String workerId) {
+        workerLastHeartbeats.remove(workerId);
+
+        Set<String> assignedTasks = workerAssignments.remove(workerId);
+
+        if (assignedTasks == null || assignedTasks.isEmpty()) {
+            System.out.println(
+                    "No unfinished tasks to recover from " + workerId);
+
+            dispatchAvailableTasks();
+            return;
+        }
+
+        List<TaskQueue.TaskAssignment> tasksToRetry = new ArrayList<>();
+
+        synchronized (assignedTasks) {
+            for (String taskId : new ArrayList<>(assignedTasks)) {
+
+                TaskQueue.TaskAssignment task = inFlightAssignments.remove(taskId);
+
+                if (task != null) {
+                    tasksToRetry.add(task);
+                }
+            }
+
+            assignedTasks.clear();
+        }
+
+        System.out.println(
+                "Recovering " + tasksToRetry.size()
+                        + " unfinished tasks from " + workerId);
+
+        for (TaskQueue.TaskAssignment task : tasksToRetry) {
+            retryAndRequeueTask(
+                    task,
+                    "Worker " + workerId + " disconnected");
+        }
+
+        dispatchAvailableTasks();
+    }
+
+    private static final long HEARTBEAT_TIMEOUT_MS = 6000;
+
+    private final Map<String, Long> workerLastHeartbeats = new ConcurrentHashMap<>();
+
+    private final ScheduledExecutorService heartbeatMonitor = Executors.newSingleThreadScheduledExecutor();
+
+    public void handleHeartbeat(String workerId) {
+        workerLastHeartbeats.put(workerId, System.currentTimeMillis());
+    }
+
+    public void startHeartbeatMonitor() {
+
+        heartbeatMonitor.scheduleAtFixedRate(() -> {
+
+            long currentTime = System.currentTimeMillis();
+
+            for (Map.Entry<String, Long> entry : workerLastHeartbeats.entrySet()) {
+
+                String workerId = entry.getKey();
+                long lastHeartbeat = entry.getValue();
+
+                if (currentTime - lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
+
+                    System.err.println(
+                            "Worker " + workerId + " heartbeat timeout!");
+
+                    WorkerHandler handler = WorkerRegistry.getHandler(workerId);
+
+                    if (handler != null) {
+                        handler.disconnect();
+                    }
+                }
+
+            }
+
+        }, 2, 2, TimeUnit.SECONDS);
+    }
+
+    private final Map<String, ClientConnection> clientConnections = new ConcurrentHashMap<>();
+
+    private final Map<String, Long> jobStartTimes = new ConcurrentHashMap<>();
+
+    private static class ClientConnection {
+
+        private final Socket socket;
+        private final PrintWriter out;
+
+        public ClientConnection(Socket socket) throws IOException {
+            this.socket = socket;
+            this.out = new PrintWriter(socket.getOutputStream(), true);
+        }
+
+        public boolean send(Message message) {
+            out.print(message.toWireString());
+            out.flush();
+            return !out.checkError();
+        }
+
+        public void close() {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // Ignore socket closure errors.
+            }
+        }
+    }
+
 }

@@ -19,7 +19,7 @@ public final class ComputeEngine {
         int end = requireInteger(rowRange.get(1), "rowRange");
         if (start < 0 || end < start || (long) end - start + 1 != matrixA.size()) {
             throw new IllegalArgumentException("rowRange must describe the supplied rows of matrixA");
-        }
+        } 
 
         List<List<BigDecimal>> rowsA = parseMatrix(matrixA, "matrixA");
         List<List<BigDecimal>> rowsB = parseMatrix(matrixB, "matrixB");

@@ -62,6 +62,84 @@ When prompted in the first terminal, enter one JSON payload:
 {"taskId":"manual-1","rowRange":[0,1],"matrixA":[[1,2],[3,4]],"matrixB":[[5,6],[7,8]]}
 ```
 
+
+
+## How to Compile and Run the Distributed Compute Grid
+
+Follow these steps to compile and run the project on macOS.
+
+### 1. Compile the Project
+
+Open Terminal in the project root directory and execute:
+
+```bash
+javac -d out $(find src/main/java -name "*.java")
+```
+
+If compilation succeeds, proceed to the next steps.
+
+### 2. Start the Coordinator
+
+Open Terminal 1 and execute:
+
+```bash
+java -cp out coordinator.Main
+```
+
+The Coordinator will start listening for connections on port `5001`.
+
+### 3. Start Worker 1
+
+Open Terminal 2 and execute:
+
+```bash
+java -cp out worker.WorkerMain localhost 5001 worker-1 2
+```
+
+### 4. Start Worker 2
+
+Open Terminal 3 and execute:
+
+```bash
+java -cp out worker.WorkerMain localhost 5001 worker-2 2
+```
+
+Additional Workers can be started using different Worker IDs. For example:
+
+```bash
+java -cp out worker.WorkerMain localhost 5001 worker-3 2
+```
+
+The final argument (`2`) specifies the maximum number of concurrent task chunks that the Worker can process.
+
+### 5. Start the Client
+
+Open Terminal 4 and execute:
+
+```bash
+java -cp out client.Client
+```
+
+The Client allows users to enter matrix dimensions and choose between manually entering matrix values or generating random values. It submits the matrix multiplication job to the Coordinator and receives the final result.
+
+### Execution Order
+
+Start the components in the following order:
+
+1. Compile the project.
+2. Start the Coordinator.
+3. Start Worker 1.
+4. Start Worker 2.
+5. Start the Client.
+
+**Important Notes:**
+- Keep the Coordinator, Workers, and Client terminals open while the application is running.
+- The Coordinator must be started before the Workers.
+- Workers must connect to the Coordinator using the correct host and port.
+- The Client can submit matrix multiplication jobs after the Coordinator is running.
+- To apply source code changes, compile the project again before restarting the application.
+
+
 The worker should display the task and result `[[19,22],[43,50]]`; the manual
 test server prints `PASS` if the returned result matches. The test server
 handles one worker and one task per run. Type `quit` in the worker terminal
