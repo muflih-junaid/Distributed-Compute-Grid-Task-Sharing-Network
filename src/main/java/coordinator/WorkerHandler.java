@@ -40,6 +40,7 @@ public class WorkerHandler {
                 return;
             }
             WorkerRegistry.registerHandler(workerId, this);
+            coordinator.handleHeartbeat(workerId);
 
             System.out.println(workerId + " registered successfully");
             JsonObject response = new JsonObject();
@@ -62,7 +63,7 @@ public class WorkerHandler {
                         break;
 
                     case Message.HEARTBEAT:
-                        System.out.println(workerId + " heartbeat received");
+                        coordinator.handleHeartbeat(workerId);
                         break;
 
                     case Message.TASK_RESULT:
@@ -79,7 +80,16 @@ public class WorkerHandler {
         } catch (IOException e) {
             System.out.println(workerId + " disconnected");
         } finally {
-            WorkerRegistry.remove(workerId, socket);
+
+            boolean wasRegistered = WorkerRegistry.removeAndCheck(workerId, socket);
+
+            if (wasRegistered) {
+                System.out.println(
+                        "Worker " + workerId + " removed from registry");
+
+                coordinator.handleWorkerDisconnect(workerId);
+            }
+
             try {
                 socket.close();
             } catch (IOException e) {
@@ -107,11 +117,37 @@ public class WorkerHandler {
         throw new IllegalArgumentException("maxConcurrentChunks must be a positive integer");
     }
 
-    public void sendMessage(Message message) {
-        if (message == null) {
-            return;
+    public synchronized boolean sendMessage(Message message) {
+        if (message == null || socket.isClosed()) {
+            return false;
         }
-        out.print(message.toWireString());
-        out.flush();
+
+        try {
+            out.print(message.toWireString());
+            out.flush();
+
+            if (out.checkError()) {
+                System.err.println("Failed to send message to Worker");
+                return false;
+            }
+
+            return true;
+
+        } catch (Exception exception) {
+            System.err.println("Error sending message to Worker: "
+                    + exception.getMessage());
+            return false;
+        }
+    }
+
+    public void disconnect() {
+        System.out.println("Closing unresponsive Worker connection");
+
+        try {
+            socket.close();
+        } catch (IOException e) {
+            System.err.println(
+                    "Error closing Worker connection: " + e.getMessage());
+        }
     }
 }
