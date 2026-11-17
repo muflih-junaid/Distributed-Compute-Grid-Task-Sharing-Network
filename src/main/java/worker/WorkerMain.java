@@ -51,7 +51,6 @@ public final class WorkerMain {
                 return parsed;
             }
         } catch (NumberFormatException exception) {
-            // Report the invalid command-line value below.
         }
         throw new IllegalArgumentException("Invalid " + name + ": " + value);
     }
